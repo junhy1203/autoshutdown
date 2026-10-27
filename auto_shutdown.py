@@ -350,7 +350,7 @@ def run_standalone_autologin_gui():
 
     root.mainloop()
 
-CURRENT_VERSION = "1.1.206"
+CURRENT_VERSION = "1.1.207"
 
 try:
     from pycaw.pycaw import AudioUtilities
@@ -490,6 +490,20 @@ def get_pc_id():
 
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
+
+def force_close_window(hwnd):
+    """창 소유 프로세스를 작업 관리자의 작업 끝내기처럼 강제 종료한다."""
+    if isinstance(hwnd, bool) or not str(hwnd).isdecimal():
+        return False
+    hwnd = int(hwnd)
+    if not 0 < hwnd < (1 << (ctypes.sizeof(wintypes.HWND) * 8)):
+        return False
+    pid = wintypes.DWORD()
+    if not ctypes.windll.user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), ctypes.byref(pid)) or not pid.value:
+        return False
+    kill_remote_process(pid.value)
+    return True
+
 
 def get_open_windows():
     """ALT+TAB 목록과 동일한 방식으로 사용자에게 보이는 창만 반환"""
@@ -1187,13 +1201,7 @@ class AutoShutdownAppV2:
                                                 ctypes.windll.user32.SetForegroundWindow(target_hwnd)
                                             except Exception: pass
                                     elif action == 'close_window' and isinstance(message, dict):
-                                        target_hwnd = message.get('hwnd')
-                                        if target_hwnd:
-                                            try: target_hwnd = int(target_hwnd)
-                                            except ValueError: target_hwnd = None
-                                        if target_hwnd:
-                                            try: ctypes.windll.user32.PostMessageW(target_hwnd, 0x0010, 0, 0)
-                                            except Exception: pass
+                                        force_close_window(message.get('hwnd'))
                                     elif action == 'minimize_window' and isinstance(message, dict):
                                         target_hwnd = message.get('hwnd')
                                         if target_hwnd:
@@ -1634,17 +1642,7 @@ class AutoShutdownAppV2:
                                 except Exception: pass
                                 cmd_success = True
                         elif action == 'close_window' and isinstance(message, dict):
-                            target_hwnd = message.get('hwnd')
-                            if target_hwnd:
-                                try:
-                                    target_hwnd = int(target_hwnd)
-                                except ValueError:
-                                    target_hwnd = None
-                            if target_hwnd:
-                                try:
-                                    ctypes.windll.user32.PostMessageW(target_hwnd, 0x0010, 0, 0) # WM_CLOSE
-                                except Exception: pass
-                                cmd_success = True
+                            cmd_success = force_close_window(message.get('hwnd'))
                         elif action == 'show_desktop':
                             try:
                                 ctypes.windll.user32.keybd_event(0x5B, 0, 0, 0) # LWIN down
@@ -3485,13 +3483,7 @@ class HeadlessShutdownApp:
                                                 ctypes.windll.user32.SetForegroundWindow(target_hwnd)
                                             except Exception: pass
                                     elif action == 'close_window' and isinstance(message, dict):
-                                        target_hwnd = message.get('hwnd')
-                                        if target_hwnd:
-                                            try: target_hwnd = int(target_hwnd)
-                                            except ValueError: target_hwnd = None
-                                        if target_hwnd:
-                                            try: ctypes.windll.user32.PostMessageW(target_hwnd, 0x0010, 0, 0)
-                                            except Exception: pass
+                                        force_close_window(message.get('hwnd'))
                                     elif action == 'minimize_window' and isinstance(message, dict):
                                         target_hwnd = message.get('hwnd')
                                         if target_hwnd:
@@ -4000,13 +3992,7 @@ class HeadlessShutdownApp:
                                     except Exception: pass
                                     cmd_success = True
                             elif action == 'close_window' and isinstance(message, dict):
-                                target_hwnd = message.get('hwnd')
-                                if target_hwnd:
-                                    try:
-                                        target_hwnd_int = int(target_hwnd)
-                                        ctypes.windll.user32.PostMessageW(target_hwnd_int, 0x0010, 0, 0)
-                                    except Exception: pass
-                                    cmd_success = True
+                                cmd_success = force_close_window(message.get('hwnd'))
                             elif action == 'open_file' and isinstance(message, dict):
                                 file_path = message.get('file_path', '').strip()
                                 app_path  = message.get('app_path', '').strip()

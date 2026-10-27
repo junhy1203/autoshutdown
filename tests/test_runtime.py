@@ -1,5 +1,8 @@
 """Exercise isolated algorithms without starting the app, networking or power actions."""
 import ast
+import copy
+import ctypes
+from ctypes import wintypes
 import json
 import os
 from pathlib import Path
@@ -23,6 +26,46 @@ def load(node, namespace):
     return namespace[node.name]
 
 class RuntimeTests(unittest.TestCase):
+    def test_force_close_window_resolves_owner_and_forces_process_exit(self):
+        user32, kill = Mock(), Mock()
+        namespace = dict(ctypes=SimpleNamespace(sizeof=ctypes.sizeof, byref=ctypes.byref,
+                                                windll=SimpleNamespace(user32=user32)),
+                         wintypes=wintypes, kill_remote_process=kill)
+        close = load(extract('force_close_window'), namespace)
+
+        def resolve(hwnd, pid):
+            self.assertEqual(hwnd.value, 123)
+            pid._obj.value = 456
+            return 1
+
+        user32.GetWindowThreadProcessId.side_effect = resolve
+        self.assertTrue(close('123'))
+        kill.assert_called_once_with(456)
+        user32.PostMessageW.assert_not_called()
+        kill.reset_mock()
+        user32.GetWindowThreadProcessId.reset_mock(side_effect=True)
+        for hwnd in [None, True, 0, -1, 'invalid', {}, 1 << (ctypes.sizeof(wintypes.HWND) * 8)]:
+            with self.subTest(hwnd=hwnd):
+                self.assertFalse(close(hwnd))
+        user32.GetWindowThreadProcessId.assert_not_called()
+        user32.GetWindowThreadProcessId.return_value = 0
+        self.assertFalse(close(123))
+        user32.GetWindowThreadProcessId.return_value = 1
+        self.assertFalse(close(123))  # No owning PID returned.
+        kill.assert_not_called()
+
+    def test_all_close_window_command_routes_force_close(self):
+        routes = [node for node in ast.walk(SOURCE) if isinstance(node, ast.If)
+                  and ast.unparse(node.test) == "action == 'close_window' and isinstance(message, dict)"]
+        self.assertEqual(len(routes), 4)
+        for route in routes:
+            branch = copy.deepcopy(route)
+            branch.orelse = []
+            close = Mock(return_value=True)
+            namespace = dict(action='close_window', message={'hwnd': 123}, force_close_window=close)
+            exec(compile(ast.Module(body=[branch], type_ignores=[]), '<command route>', 'exec'), namespace)
+            close.assert_called_once_with(123)
+
     def test_config_cache_refresh_isolation_and_partial_write(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as folder:
             filename = Path(folder) / 'config.json'
