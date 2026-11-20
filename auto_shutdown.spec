@@ -1,4 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
+from os.path import join
 
 
 a = Analysis(
@@ -12,7 +13,7 @@ a = Analysis(
     datas=[
         (r'C:\Users\tntdr\AppData\Local\Programs\Python\Python313\tcl\tcl8.6', '_tcl_data'),
         (r'C:\Users\tntdr\AppData\Local\Programs\Python\Python313\tcl\tk8.6', '_tk_data'),
-        (r'dist\updater.exe', '.'),  # 업데이터 번들 포함
+        (join(DISTPATH, 'updater.exe'), '.'),
     ],
     hiddenimports=['pycaw', 'customtkinter', 'mss', 'mss.tools', 'aiortc', 'av', 'pynput', 'pynput.keyboard', 'pynput.mouse', 'google_crc32c', 'cffi', '_cffi_backend', 'pylibsrtp', 'numpy', 'av.logging', 'av.video.frame', 'av.audio.frame'],
     hookspath=[],

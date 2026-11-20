@@ -10,8 +10,11 @@ import tempfile
 import threading
 import unittest
 from datetime import datetime, timedelta
+from email.utils import formatdate, parsedate_to_datetime
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
+import time
+import urllib.request
 
 SOURCE = ast.parse((Path(__file__).resolve().parents[1] / 'auto_shutdown.py').read_text(encoding='utf-8'))
 
@@ -30,7 +33,7 @@ class RuntimeTests(unittest.TestCase):
         user32, kill = Mock(), Mock()
         namespace = dict(ctypes=SimpleNamespace(sizeof=ctypes.sizeof, byref=ctypes.byref,
                                                 windll=SimpleNamespace(user32=user32)),
-                         wintypes=wintypes, kill_remote_process=kill)
+                         wintypes=wintypes, kill_remote_process=kill, os=SimpleNamespace(getpid=lambda: 999))
         close = load(extract('force_close_window'), namespace)
 
         def resolve(hwnd, pid):
@@ -43,6 +46,8 @@ class RuntimeTests(unittest.TestCase):
         kill.assert_called_once_with(456)
         user32.PostMessageW.assert_not_called()
         kill.reset_mock()
+        namespace['os'].getpid = lambda: 456
+        self.assertFalse(close(123))
         user32.GetWindowThreadProcessId.reset_mock(side_effect=True)
         for hwnd in [None, True, 0, -1, 'invalid', {}, 1 << (ctypes.sizeof(wintypes.HWND) * 8)]:
             with self.subTest(hwnd=hwnd):
@@ -65,6 +70,63 @@ class RuntimeTests(unittest.TestCase):
             namespace = dict(action='close_window', message={'hwnd': 123}, force_close_window=close)
             exec(compile(ast.Module(body=[branch], type_ignores=[]), '<command route>', 'exec'), namespace)
             close.assert_called_once_with(123)
+
+    def test_command_poll_clears_expired_entries_and_keeps_broadcasts(self):
+        from security import fresh_command
+
+        server_now = 1_700_000_000
+        expired = {'action': 'restart', 'timestamp': server_now - 60}
+        recent = {'action': 'minimize_window', 'timestamp': server_now - 2}
+        broadcast = {'action': 'volume_control', 'timestamp': server_now - 15}
+        calls = []
+
+        def open_request(request, **kwargs):
+            url = request.full_url
+            calls.append(url)
+            if request.get_method() == 'DELETE':
+                return MockContext(None)
+            self.assertEqual(request.get_method(), 'GET')
+            payload = broadcast if url.endswith('/__ALL__.json') else {'old': expired, 'new': recent}
+            return MockContext(payload)
+
+        class MockContext:
+            def __init__(self, payload):
+                self.headers = {'Date': formatdate(server_now, usegmt=True)}
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def read(self):
+                return json.dumps(self.payload).encode()
+
+        poll = load(extract('read_pending_commands'), dict(urllib=urllib, json=json, time=time,
+                    parsedate_to_datetime=parsedate_to_datetime, fresh_command=fresh_command))
+        root = 'https://example.test'
+        processed = set()
+        with patch.object(urllib.request, 'urlopen', side_effect=open_request):
+            self.assertEqual(list(poll(root, 'pc', None, processed)), [recent])
+            self.assertEqual(list(poll(root, '__ALL__', None, processed)), [broadcast])
+            self.assertEqual(list(poll(root, '__ALL__', None, processed)), [])
+        self.assertIn(root + '/commands/pc/old.json', calls)
+        self.assertIn(root + '/commands/pc/new.json', calls)
+        self.assertEqual(calls.count(root + '/commands/__ALL__.json'), 2)
+
+    def test_headless_listener_bind_failure_keeps_client_running(self):
+        import socket
+
+        app = SimpleNamespace(is_running=True)
+        listen = load(extract('socket_listener', 'HeadlessShutdownApp'), {'socket': socket, 'print': Mock()})
+        transport = Mock()
+        transport.__enter__ = Mock(return_value=transport)
+        transport.__exit__ = Mock(return_value=False)
+        transport.bind.side_effect = OSError('in use')
+        with patch.object(socket, 'socket', return_value=transport):
+            listen(app)
+        self.assertTrue(app.is_running)
 
     def test_config_cache_refresh_isolation_and_partial_write(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as folder:

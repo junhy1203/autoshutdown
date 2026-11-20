@@ -3282,11 +3282,12 @@ async function writeCommandToDB(target, action, message = "") {
     const bodyData = {
         action: action,
         message: message,
-        timestamp: Date.now() / 1000.0
+        timestamp: (Date.now() + serverTimeOffset) / 1000
     };
 
-    // CUSTOM SERVER MODE: Send via WebSocket directly for real-time speed
-    if (window._serverMode === 'custom' && window._customWs && window._customWs.readyState === WebSocket.OPEN) {
+    // Keep interactive input on the low-latency connection. Control buttons use the client queue.
+    if (action === 'remote_input' && window._serverMode === 'custom' &&
+        window._customWs && window._customWs.readyState === WebSocket.OPEN) {
         try {
             window._customWs.send(JSON.stringify({
                 type: "command",

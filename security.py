@@ -26,9 +26,10 @@ def remote_config(config):
     return {key: value for key, value in config.items() if key in PUBLIC_CONFIG_KEYS}
 
 
-def fresh_command(timestamp, max_age=20):
+def fresh_command(timestamp, max_age=20, *, now=None):
+    now = time.time() if now is None else now
     return (isinstance(timestamp, (float, int)) and not isinstance(timestamp, bool)
-            and 0 <= time.time() - timestamp <= max_age)
+            and now - max_age <= timestamp <= now)
 
 
 def private_updater_copy(source):
@@ -77,6 +78,8 @@ def open_remote_url(url, browser='default'):
 def kill_remote_process(pid):
     if isinstance(pid, bool) or not str(pid).isdecimal() or not 0 < int(pid) <= 0xffffffff:
         raise ValueError('Invalid process id')
+    if int(pid) == os.getpid():
+        raise ValueError('Cannot terminate the client itself')
     subprocess.run(['taskkill', '/F', '/PID', str(int(pid))],
                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0), check=False)
 

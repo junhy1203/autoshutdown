@@ -129,8 +129,8 @@ except Exception as e:
     print(f"[Error] 암호화 실패: {e}")
 print("\n[3단계] auto_shutdown.exe PyInstaller 빌드 중... (시간이 걸릴 수 있습니다)")
 try:
-    subprocess.run(["pyinstaller", "--noconfirm", spec_path],
-                   check=True, cwd=BASE_DIR)
+    for build_spec in ('updater.spec', 'ManualUpdater.spec', spec_path):
+        subprocess.run(["pyinstaller", "--noconfirm", build_spec], check=True, cwd=BASE_DIR)
 except Exception as e:
     print(f"[Error] 빌드 실패: {e}")
     content = content.replace(f'CURRENT_VERSION = "{new_v}"', f'CURRENT_VERSION = "{current_v}"')

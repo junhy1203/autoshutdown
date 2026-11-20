@@ -2,11 +2,13 @@ import os
 import sys
 import threading
 import base64
+from pathlib import Path
 import winreg
 import getpass
 from security import (protect_password, unprotect_password, store_logon_secret,
                       public_config, remote_config, fresh_command, private_updater_copy, validate_ws_url,
                       validate_download_url, open_remote_url, kill_remote_process)
+from update_files import launch_detached, remove_update_file
 
 def _get_encryption_key():
     import uuid
@@ -96,6 +98,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 import re
 from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
 import ssl
 
 import urllib.request
@@ -117,10 +120,11 @@ try:
     _original_urlopen = urllib.request.urlopen
     
     class MockResponse:
-        def __init__(self, content, status):
+        def __init__(self, content, status, headers):
             self.content = content
             self.status = status
             self.code = status
+            self.headers = headers
         def read(self):
             return self.content
         def __enter__(self):
@@ -169,7 +173,7 @@ try:
                         from io import BytesIO
                         raise urllib.error.HTTPError(url, res.status_code, res.reason, res.headers, BytesIO(res.content))
                         
-                    return MockResponse(res.content, res.status_code)
+                    return MockResponse(res.content, res.status_code, res.headers)
                 except urllib.error.HTTPError:
                     raise
                 except requests.RequestException as e:
@@ -350,7 +354,7 @@ def run_standalone_autologin_gui():
 
     root.mainloop()
 
-CURRENT_VERSION = "1.1.207"
+CURRENT_VERSION = "1.1.208"
 
 try:
     from pycaw.pycaw import AudioUtilities
@@ -364,6 +368,79 @@ else:
     application_path = os.path.dirname(os.path.abspath(__file__))
 
 CONFIG_FILE = os.path.join(application_path, "schedule_config.json")
+
+
+def hand_off_update(download_url, is_running, args=()):
+    if not getattr(sys, 'frozen', False):
+        raise RuntimeError('업데이트는 설치된 실행 파일에서 사용할 수 있습니다.')
+    download_url = validate_download_url(download_url)
+    executable = Path(sys.executable)
+    bundled_updater = Path(sys._MEIPASS) / 'updater.exe'
+    source = bundled_updater if bundled_updater.is_file() else executable.with_name('updater.exe')
+    updater = Path(private_updater_copy(source))
+    ready = updater.parent / 'ready'
+    process = None
+    try:
+        process = launch_detached(updater, ['--handoff', str(os.getpid()), download_url,
+                                            str(executable), str(updater.parent), *args])
+        while is_running():
+            if process.poll() is not None:
+                raise RuntimeError('업데이트 준비에 실패했습니다. updater.log를 확인하세요.')
+            if ready.exists():
+                # The updater only replaces the executable after this acknowledgement and process exit.
+                ready.rename(updater.parent / 'apply')
+                os._exit(0)
+            time.sleep(0.25)
+    finally:
+        if process is None or process.poll() is not None:
+            remove_update_file(updater)
+            try:
+                updater.parent.rmdir()
+            except OSError:
+                pass
+
+
+def read_pending_commands(central_url, target, ssl_context, processed):
+    command_url = f"{central_url.rstrip('/')}/commands/{target}"
+    try:
+        request = urllib.request.Request(command_url + '.json')
+        with urllib.request.urlopen(request, timeout=5, context=ssl_context) as response:
+            data = json.loads(response.read())
+            try:
+                # HTTP dates have whole-second precision.
+                now = parsedate_to_datetime(response.headers.get('Date', '')).timestamp() + 1
+            except (ValueError, OverflowError):
+                now = time.time()
+    except (OSError, ValueError) as exc:
+        print(f'명령 조회 실패 ({target}): {exc}')
+        return
+    if not isinstance(data, dict):
+        return
+
+    entries = [(None, data)] if 'action' in data else data.items()
+    for push_id, payload in entries:
+        if not isinstance(payload, dict) or not isinstance(payload.get('action'), str):
+            continue
+        timestamp = payload.get('timestamp')
+        is_fresh = fresh_command(timestamp, now=now)
+        key = (target, push_id or (payload['action'], timestamp)) if is_fresh else None
+
+        # Clear expired individual requests too. Broadcasts stay visible to other PCs.
+        if target != '__ALL__':
+            delete_url = f'{command_url}/{push_id}.json' if push_id else command_url + '.json'
+            request = urllib.request.Request(delete_url, method='DELETE')
+            try:
+                with urllib.request.urlopen(request, timeout=2, context=ssl_context):
+                    pass
+            except OSError as exc:
+                print(f'명령 삭제 실패 ({target}): {exc}')
+        if key is None or key in processed:
+            continue
+        if len(processed) >= 1000:
+            processed.clear()
+        processed.add(key)
+        yield payload
+
 
 DAYS = ["월", "화", "수", "목", "금", "토", "일"]
 TIMETABLE = {
@@ -501,6 +578,8 @@ def force_close_window(hwnd):
     pid = wintypes.DWORD()
     if not ctypes.windll.user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), ctypes.byref(pid)) or not pid.value:
         return False
+    if pid.value == os.getpid():
+        return False
     kill_remote_process(pid.value)
     return True
 
@@ -548,6 +627,8 @@ def get_open_windows():
                 return True
             pid = ctypes.c_ulong()
             ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value == os.getpid():
+                return True
             exe = "unknown.exe"
             try:
                 h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
@@ -936,6 +1017,7 @@ class AutoShutdownAppV2:
         hide_btn.pack(side="right")
         
         self.is_running = True
+        self._update_lock = threading.Lock()
         self.icon = None
         self.last_triggered_time = None
         self.pending_shutdown = False
@@ -946,7 +1028,6 @@ class AutoShutdownAppV2:
         self.api_key_error_shown = False
         self.snooze_target = None
         self.snooze_action = "시스템 종료"
-        self.last_all_cmd_ts = 0
         self.triggered_custom_schedules = set()
         self.custom_schedules = {}
         
@@ -960,7 +1041,8 @@ class AutoShutdownAppV2:
             pass
         
         threading.Thread(target=self.monitor_time, daemon=True).start()
-        threading.Thread(target=self.check_for_updates, daemon=True).start()
+        if '--skip-auto-update' not in sys.argv:
+            threading.Thread(target=self.check_for_updates, daemon=True).start()
         threading.Thread(target=self.http_poller_thread, daemon=True).start()
         threading.Thread(target=self.custom_server_ws_thread, daemon=True).start()
             
@@ -1135,6 +1217,9 @@ class AutoShutdownAppV2:
                         while self.is_running:
                             try:
                                 msg_raw = ws.recv()
+                            except (websockets.exceptions.ConnectionClosed, OSError):
+                                break
+                            try:
                                 msg = json.loads(msg_raw)
                                 if msg.get("type") == "command":
                                     action = msg.get("action")
@@ -1152,7 +1237,7 @@ class AutoShutdownAppV2:
                                         import subprocess
                                         subprocess.run(['shutdown', '/r', '/t', '0'], creationflags=subprocess.CREATE_NO_WINDOW)
                                     elif action == 'update':
-                                        threading.Thread(target=self.check_for_updates, kwargs={'silent': True, 'force': True}, daemon=True).start()
+                                        threading.Thread(target=self.check_for_updates, kwargs={'force': True}, daemon=True).start()
                                     elif action == 'setup_mode':
                                         threading.Thread(target=self.run_setup_mode, daemon=True).start()
                                     elif action == 'alert':
@@ -1165,26 +1250,31 @@ class AutoShutdownAppV2:
                                             comtypes.CoInitialize()
                                             _devs = AudioUtilities.GetSpeakers()
                                             _vol_intf = _devs.EndpointVolume
-                                            level = float(payload.get('level', 0.5))
+                                            command = message if isinstance(message, dict) else payload
+                                            level = float(command.get('level', 0.5))
                                             _vol_intf.SetMasterVolumeLevelScalar(level, None)
                                         except: pass
                                     elif action == 'open_url':
-                                        url = payload.get("url", "")
-                                        browser = payload.get("browser", "default")
+                                        command = message if isinstance(message, dict) else payload
+                                        url = command.get('url', '')
+                                        browser = command.get('browser', 'default')
                                         if url:
                                             import subprocess
                                             open_remote_url(url, browser)
                                     elif action == 'open_file':
-                                        file_path = payload.get("file_path", "")
-                                        app_path = payload.get("app_path", "")
+                                        command = message if isinstance(message, dict) else payload
+                                        file_path = command.get('file_path', '')
+                                        app_path = command.get('app_path', '')
                                         if file_path:
                                             import subprocess, os
                                             if app_path and os.path.exists(app_path):
                                                 subprocess.Popen([app_path, file_path])
                                             else:
-                                                os.startfile(file_path)
+                                                if file_path.lower().startswith(('http://', 'https://')):
+                                                    open_remote_url(file_path)
+                                                else:
+                                                    os.startfile(file_path)
                                     elif action == 'screenshot':
-                                        import threading
                                         threading.Thread(target=_take_and_upload_screenshot, args=(central_url, pc_id, "", ssl_context), daemon=True).start()
                                     elif action == 'stream_start':
                                         _start_screen_streaming(central_url, pc_id, "", ssl_context)
@@ -1314,8 +1404,8 @@ class AutoShutdownAppV2:
                                             ctypes.windll.user32.keybd_event(0x5B, 0, 2, 0)
                                         except Exception: pass
                                     
-                            except Exception as e:
-                                break
+                            except Exception as exc:
+                                print(f'WebSocket 명령 처리 실패: {exc}')
                     
                     recv_thread = threading.Thread(target=recv_loop, daemon=True)
                     recv_thread.start()
@@ -1394,7 +1484,7 @@ class AutoShutdownAppV2:
                 db_secret = current_cfg.get('db_secret', '')  # Firebase DB secret for auth
                 
                 ip = get_local_ip()
-                ssl_context = ssl.create_default_context()
+                ssl_context = _global_ssl_context
                 
                 try:
                     current_user = os.getlogin()
@@ -1459,94 +1549,14 @@ class AutoShutdownAppV2:
                 
                 # 2. 다른 PC 목록 가져오기 (비활성화 - Firebase 직접 연동)
                 
-                # 3. 대기 중인 명령 확인 (GET)
-                cmd = None
-                cmd_type = None
-                
-                # 개별 명령 조회
-                cmd_url = f"{central_url.rstrip('/')}/commands/{pc_id}.json"
-                cmd_req = urllib.request.Request(cmd_url, method='GET')
-                try:
-                    with urllib.request.urlopen(cmd_req, timeout=6, context=ssl_context) as res:
-                        cmd = json.loads(res.read().decode('utf-8'))
-                        if cmd:
-                            cmd_type = 'individual'
-                except Exception as e:
-                    try:
-                        with open(os.path.join(application_path, 'error.log'), 'a', encoding='utf-8') as ef:
-                            ef.write(f"[{datetime.now()}] GET cmd error: {e}\n")
-                    except: pass
-                        
-                # 개별 명령이 없으면 전체 명령 조회
-                if not cmd:
-                    all_cmd_url = f"{central_url.rstrip('/')}/commands/__ALL__.json"
-                    all_cmd_req = urllib.request.Request(all_cmd_url, method='GET')
-                    try:
-                        with urllib.request.urlopen(all_cmd_req, timeout=6, context=ssl_context) as res:
-                            cmd = json.loads(res.read().decode('utf-8'))
-                            if cmd:
-                                cmd_type = 'all'
-                                cmd_ts = cmd.get('timestamp', 0)
-                                # 이미 처리한 전체 명령이거나 5분 이상 지난 오래된 명령이면 무시
-                                if cmd_ts == getattr(self, 'last_all_cmd_ts', 0) or time.time() - cmd_ts > 300.0:
-                                    cmd = None
-                                else:
-                                    # 유효한 전체 명령이므로 중복 실행을 막기 위해 타임스탬프 기록
-                                    self.last_all_cmd_ts = cmd_ts
-                    except Exception as e:
-                        try:
-                            with open(os.path.join(application_path, 'error.log'), 'a', encoding='utf-8') as ef:
-                                ef.write(f"[{datetime.now()}] GET all cmd error: {e}\n")
-                        except: pass
-                                
-                # 명령 실행
-                if cmd and isinstance(cmd, dict):
-                    commands_to_process = []
-                    if "action" in cmd:
-                        commands_to_process.append((None, cmd))
-                    else:
-                        for push_id, payload in cmd.items():
-                            if isinstance(payload, dict) and "action" in payload:
-                                commands_to_process.append((push_id, payload))
-
-                    for push_id, payload in commands_to_process:
-                        action = payload.get("action")
-                        message = payload.get("message", "")
-                        
-                        # 10초 이상 지난 오래된 명령 무시 및 삭제
-                        cmd_ts = payload.get("timestamp", 0)
-                        
-                        dedup_key = push_id if push_id else f"{action}_{cmd_ts}"
-                        if dedup_key in processed_push_ids:
-                            continue
-                            
-                        processed_push_ids.add(dedup_key)
-                        if len(processed_push_ids) > 1000:
-                            processed_push_ids.clear()
-                            
-                        if not fresh_command(cmd_ts):
-                            cmd_success = True
-                            continue
-                            
-                        # [핵심] 명령 중복 실행 방지를 위해 '실행 전 먼저 삭제'
-                        if cmd_type == 'individual':
-                            if push_id:
-                                del_url = f"{central_url.rstrip('/')}/commands/{pc_id}/{push_id}.json"
-                            else:
-                                del_url = f"{central_url.rstrip('/')}/commands/{pc_id}.json"
-                                
-                            db_secret = current_cfg.get('db_secret', '')
-                            if db_secret: del_url += f"?auth={db_secret}"
-                            del_req = urllib.request.Request(del_url, method='DELETE', headers={'User-Agent': 'Mozilla/5.0'})
-                            try:
-                                with urllib.request.urlopen(del_req, timeout=5, context=ssl_context) as res:
-                                    pass
-                            except Exception as de:
-                                pass
-                            
-                            # 삭제 후 상태 업데이트 시간 강제 초기화
+                for target in (pc_id, '__ALL__'):
+                    cmd_type = 'all' if target == '__ALL__' else 'individual'
+                    for payload in read_pending_commands(central_url, target, ssl_context, processed_push_ids):
+                        action = payload['action']
+                        message = payload.get('message', '')
+                        if cmd_type == 'individual' and action != 'remote_input':
                             self.last_status_update = 0
-                    
+
                         # 진단 로그: 명령 수신 기록
                         try:
                             with open(os.path.join(application_path, 'error.log'), 'a', encoding='utf-8') as ef:
@@ -2116,6 +2126,8 @@ class AutoShutdownAppV2:
             pass
 
     def perform_auto_update(self, download_url, is_manual=False, silent=False):
+        if not self._update_lock.acquire(blocking=False):
+            return
         threading.Thread(
             target=self._launch_updater_process,
             args=(download_url,),
@@ -2123,64 +2135,15 @@ class AutoShutdownAppV2:
         ).start()
 
     def _launch_updater_process(self, download_url):
-        """독립 updater.exe 프로세스를 실행하고, 메인 프로그램을 종료한다.
-
-        순서:
-          1. updater.exe 위치 파악 (PyInstaller 번들 내 _MEIPASS, 또는 exe 옆)
-          2. 실행 가능한 임시 경로로 복사 (MEIPASS는 종료 시 삭제됨)
-          3. updater.exe <pid> <download_url> <target_exe_path> 실행 (분리 프로세스)
-          4. 현재 프로세스(메인) 종료
-        """
-        _ulog_path = os.path.join(application_path, 'update_debug.log')
-        def _ulog(msg):
-            try:
-                with open(_ulog_path, 'a', encoding='utf-8') as f:
-                    f.write(f"[{datetime.now()}] {msg}\n")
-            except Exception:
-                pass
-
         try:
-            if not getattr(sys, 'frozen', False):
-                _ulog("[updater] Not frozen exe — skipping update.")
-                return
-
-            # 1. updater.exe 원본 위치
-            meipass_updater = os.path.join(sys._MEIPASS, 'updater.exe')
-            exe_dir_updater = os.path.join(os.path.dirname(sys.executable), 'updater.exe')
-            if os.path.exists(meipass_updater):
-                src_updater = meipass_updater
-            elif os.path.exists(exe_dir_updater):
-                src_updater = exe_dir_updater
-            else:
-                _ulog("[updater] updater.exe not found in MEIPASS or exe dir!")
-                return
-
-            # 2. 임시 경로로 복사 (MEIPASS는 프로세스 종료 시 삭제됨)
-            import shutil
-            tmp_updater = private_updater_copy(src_updater)
-            _ulog(f"[updater] Copied updater to: {tmp_updater}")
-
-            # 3. 대상 경로: %LOCALAPPDATA%\AutoShutdown\auto_shutdown.exe
-            local_app = os.environ.get('LOCALAPPDATA', application_path)
-            target_dir = os.path.join(local_app, 'AutoShutdown')
-            target_exe = os.path.join(target_dir, 'auto_shutdown.exe')
-
-            pid = str(os.getpid())
-            cmd = [tmp_updater, pid, download_url, target_exe]
-            _ulog(f"[updater] Launching: {cmd}")
-
-            subprocess.Popen(
-                cmd,
-                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
-            )
-            _ulog("[updater] Updater process launched. Quitting main app.")
-
-            # 4. 메인 프로세스 종료
-            self.root.after(0, self.quit_app)
-
+            hand_off_update(download_url, lambda: self.is_running)
         except Exception as e:
-            _ulog(f"[updater] _launch_updater_process FAILED: {e}")
             self._show_update_error(f"업데이트 준비 중 오류: {e}")
+        finally:
+            self._update_lock.release()
+            self._update_in_progress = False
+            if self.is_running:
+                self.root.after(0, self._restore_update_btn)
 
     def load_config(self):
         try:
@@ -2540,27 +2503,17 @@ class AutoShutdownAppV2:
             self.root.after(0, lambda: self._handle_update_check_result(remote_version, download_url, None))
         except Exception as e:
             # 실패 시 에러를 메인 스레드로 전달
-            self.root.after(0, lambda: self._handle_update_check_result(None, None, str(e)))
+            self.root.after(0, self._handle_update_check_result, None, None, str(e))
 
     def _handle_update_check_result(self, remote_version, download_url, error_msg):
         self._restore_update_btn()
-        
-        if error_msg:
-            _log(f"업데이트 오류: {error_msg}")
+        if error_msg or not download_url:
+            self._show_update_error(error_msg or '버전 정보를 불러오지 못했습니다.')
             return
-            
-        if self._is_newer_version(remote_version, CURRENT_VERSION) and download_url:
-            _log(f"새로운 버전(v{remote_version}) 업데이트를 조용히 시작합니다.")
-            if hasattr(self, 'update_btn') and self.update_btn and self.update_btn.winfo_exists():
-                self.update_btn.configure(state="disabled", text="📥 다운로드 준비 중...")
-            self.perform_auto_update(download_url, is_manual=True)
-        elif download_url:
-            _log(f"현재 최신 버전(v{CURRENT_VERSION})을 사용 중입니다. 강제 재설치를 조용히 시작합니다.")
-            if hasattr(self, 'update_btn') and self.update_btn and self.update_btn.winfo_exists():
-                self.update_btn.configure(state="disabled", text="📥 다운로드 준비 중...")
-            self.perform_auto_update(download_url, is_manual=True)
-        else:
-            _log("업데이트 오류: 버전 정보를 불러오지 못했습니다.")
+
+        if getattr(self, 'update_btn', None) and self.update_btn.winfo_exists():
+            self.update_btn.configure(state='disabled', text=f'📥 v{remote_version} 다운로드 준비 중...')
+        self.perform_auto_update(download_url, is_manual=True)
 
     def _update_download_progress(self, percent):
         try:
@@ -2617,7 +2570,7 @@ class AutoShutdownAppV2:
                 remote_version = data.get("version", CURRENT_VERSION)
                 download_url = data.get("download_url")
 
-            if download_url and (self._is_newer_version(remote_version, CURRENT_VERSION) or True):
+            if download_url:
                 # 새 버전이든 같은 버전이든 바로 다운로드 (트레이는 무조건 실행)
                 self._tray_update_label = f"📥 v{remote_version} 다운로드 준비 중..."
                 try:
@@ -3172,9 +3125,9 @@ class HeadlessShutdownApp:
     def __init__(self):
         _sync_windows_time()
         self.is_running = True
+        self._update_lock = threading.Lock()
         self.skipped_events = set()
         self.last_triggered_time = None
-        self.last_all_cmd_ts = 0
         self.config = self.load_config()
         self.triggered_custom_schedules = set()
         self.custom_schedules = {}
@@ -3184,7 +3137,8 @@ class HeadlessShutdownApp:
         threading.Thread(target=self.monitor_time, daemon=True).start()
         threading.Thread(target=self.http_poller_thread, daemon=True).start()
         threading.Thread(target=self.custom_server_ws_thread, daemon=True).start()
-        threading.Thread(target=self.check_for_updates, daemon=True).start()
+        if '--skip-auto-update' not in sys.argv:
+            threading.Thread(target=self.check_for_updates, daemon=True).start()
         
         # 메인 스레드 유지
         while self.is_running:
@@ -3326,40 +3280,32 @@ class HeadlessShutdownApp:
             time.sleep(1)
 
     def socket_listener(self):
-        import socket
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            s.bind(('127.0.0.1', 19985))
-            s.listen(1)
-        except Exception:
-            self.is_running = False
-            return
-            
-        while self.is_running:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
             try:
-                s.settimeout(1.0)
-                conn, addr = s.accept()
-            except socket.timeout:
-                continue
-            except Exception:
-                break
-                
-            try:
-                data = conn.recv(1024).decode('utf-8')
-                if data == "exit":
-                    conn.sendall(b"ok")
-                    conn.close()
-                    self.is_running = False
-                    break
-                conn.close()
-            except Exception:
-                pass
-        try:
-            s.close()
-        except:
-            pass
-        os._exit(0)
+                server.bind(('127.0.0.1', 19985))
+                server.listen(1)
+                server.settimeout(1.0)
+            except OSError as exc:
+                print(f'GUI 전환 소켓을 열지 못했습니다: {exc}')
+                return
+
+            while self.is_running:
+                try:
+                    connection, _ = server.accept()
+                except socket.timeout:
+                    continue
+                except OSError as exc:
+                    print(f'GUI 전환 소켓 오류: {exc}')
+                    return
+                with connection:
+                    try:
+                        connection.settimeout(1.0)
+                        if connection.recv(1024) == b'exit':
+                            connection.sendall(b'ok')
+                            self.is_running = False
+                            return
+                    except OSError:
+                        continue
 
 
     def custom_server_ws_thread(self):
@@ -3417,6 +3363,9 @@ class HeadlessShutdownApp:
                         while self.is_running:
                             try:
                                 msg_raw = ws.recv()
+                            except (websockets.exceptions.ConnectionClosed, OSError):
+                                break
+                            try:
                                 msg = json.loads(msg_raw)
                                 if msg.get("type") == "command":
                                     action = msg.get("action")
@@ -3434,7 +3383,7 @@ class HeadlessShutdownApp:
                                         import subprocess
                                         subprocess.run(['shutdown', '/r', '/t', '0'], creationflags=subprocess.CREATE_NO_WINDOW)
                                     elif action == 'update':
-                                        threading.Thread(target=self.check_for_updates, kwargs={'silent': True, 'force': True}, daemon=True).start()
+                                        threading.Thread(target=self.check_for_updates, kwargs={'force': True}, daemon=True).start()
                                     elif action == 'setup_mode':
                                         threading.Thread(target=self.run_setup_mode, daemon=True).start()
                                     elif action == 'alert':
@@ -3447,26 +3396,31 @@ class HeadlessShutdownApp:
                                             comtypes.CoInitialize()
                                             _devs = AudioUtilities.GetSpeakers()
                                             _vol_intf = _devs.EndpointVolume
-                                            level = float(payload.get('level', 0.5))
+                                            command = message if isinstance(message, dict) else payload
+                                            level = float(command.get('level', 0.5))
                                             _vol_intf.SetMasterVolumeLevelScalar(level, None)
                                         except: pass
                                     elif action == 'open_url':
-                                        url = payload.get("url", "")
-                                        browser = payload.get("browser", "default")
+                                        command = message if isinstance(message, dict) else payload
+                                        url = command.get('url', '')
+                                        browser = command.get('browser', 'default')
                                         if url:
                                             import subprocess
                                             open_remote_url(url, browser)
                                     elif action == 'open_file':
-                                        file_path = payload.get("file_path", "")
-                                        app_path = payload.get("app_path", "")
+                                        command = message if isinstance(message, dict) else payload
+                                        file_path = command.get('file_path', '')
+                                        app_path = command.get('app_path', '')
                                         if file_path:
                                             import subprocess, os
                                             if app_path and os.path.exists(app_path):
                                                 subprocess.Popen([app_path, file_path])
                                             else:
-                                                os.startfile(file_path)
+                                                if file_path.lower().startswith(('http://', 'https://')):
+                                                    open_remote_url(file_path)
+                                                else:
+                                                    os.startfile(file_path)
                                     elif action == 'screenshot':
-                                        import threading
                                         threading.Thread(target=_take_and_upload_screenshot, args=(central_url, pc_id, "", ssl_context), daemon=True).start()
                                     elif action == 'stream_start':
                                         _start_screen_streaming(central_url, pc_id, "", ssl_context)
@@ -3596,8 +3550,8 @@ class HeadlessShutdownApp:
                                             ctypes.windll.user32.keybd_event(0x5B, 0, 2, 0)
                                         except Exception: pass
                                     
-                            except Exception as e:
-                                break
+                            except Exception as exc:
+                                print(f'WebSocket 명령 처리 실패: {exc}')
                     
                     recv_thread = threading.Thread(target=recv_loop, daemon=True)
                     recv_thread.start()
@@ -3685,7 +3639,7 @@ class HeadlessShutdownApp:
                 current_cfg = sanitize_rtdb_keys(read_runtime_config())
                 
                 ip = get_local_ip()
-                ssl_context = ssl.create_default_context()
+                ssl_context = _global_ssl_context
                 
                 try:
                     current_user = os.getlogin()
@@ -3739,87 +3693,12 @@ class HeadlessShutdownApp:
                     except Exception as e:
                         _log(f"PUT status error: {e}")
                 
-                # 2. 명령 수신 확인 (GET)
-                cmd = None
-                cmd_type = None
-                
-                cmd_url = f"{central_url.rstrip('/')}/commands/{pc_id}.json"
-                cmd_req = urllib.request.Request(cmd_url, method='GET', headers={'User-Agent': 'Mozilla/5.0'})
-                try:
-                    with urllib.request.urlopen(cmd_req, timeout=5, context=ssl_context) as res:
-                        cmd = json.loads(res.read().decode('utf-8'))
-                        if cmd:
-                            cmd_type = 'individual'
-                            _log("CMD found (individual)")
-                except Exception as e:
-                    _log(f"GET cmd error: {e}")
-                        
-                if not cmd:
-                    all_cmd_url = f"{central_url.rstrip('/')}/commands/__ALL__.json"
-                    all_cmd_req = urllib.request.Request(all_cmd_url, method='GET', headers={'User-Agent': 'Mozilla/5.0'})
-                    try:
-                        with urllib.request.urlopen(all_cmd_req, timeout=5, context=ssl_context) as res:
-                            cmd = json.loads(res.read().decode('utf-8'))
-                            if cmd:
-                                cmd_type = 'all'
-                                cmd_ts = cmd.get('timestamp', 0)
-                                if cmd_ts == getattr(self, 'last_all_cmd_ts', 0) or time.time() - cmd_ts > 300.0:
-                                    cmd = None
-                                else:
-                                    _log("CMD found (all)")
-                                    # 유효한 전체 명령이므로 중복 실행을 막기 위해 타임스탬프 기록
-                                    self.last_all_cmd_ts = cmd_ts
-                    except Exception as e:
-                        _log(f"GET all cmd error: {e}")
-                                
-                # 3. 명령 실행
-                if cmd and isinstance(cmd, dict):
-                    commands_to_process = []
-                    if "action" in cmd:
-                        commands_to_process.append((None, cmd))
-                    else:
-                        for push_id, payload in cmd.items():
-                            if isinstance(payload, dict) and "action" in payload:
-                                commands_to_process.append((push_id, payload))
-
-                    for push_id, payload in commands_to_process:
-                        action = payload.get("action")
-                        message = payload.get("message", "")
-                        
-                        cmd_ts = payload.get("timestamp", 0)
-                        
-                        dedup_key = push_id if push_id else f"{action}_{cmd_ts}"
-                        if dedup_key in processed_push_ids:
-                            continue
-                            
-                        processed_push_ids.add(dedup_key)
-                        if len(processed_push_ids) > 1000:
-                            processed_push_ids.clear()
-                        
-                        # 10초 이상 지난 오래된 명령 무시 및 삭제
-                        if not fresh_command(cmd_ts, max_age=10):
-                            cmd_success = True
-                            _log(f"Ignored stale cmd: action={action} (older than 10s)")
-                            continue
-                            
-                        # [핵심] 명령 중복 실행 방지를 위해 '실행 전 먼저 삭제'
-                        if cmd_type == 'individual':
-                            if push_id:
-                                del_url = f"{central_url.rstrip('/')}/commands/{pc_id}/{push_id}.json"
-                            else:
-                                del_url = f"{central_url.rstrip('/')}/commands/{pc_id}.json"
-                                
-                            db_secret = current_cfg.get('db_secret', '')
-                            if db_secret: del_url += f"?auth={db_secret}"
-                            del_req = urllib.request.Request(del_url, method='DELETE', headers={'User-Agent': 'Mozilla/5.0'})
-                            try:
-                                with urllib.request.urlopen(del_req, timeout=5, context=ssl_context) as res:
-                                    pass
-                                _log("CMD deleted from Firebase before execution")
-                            except Exception as de:
-                                _log(f"CMD delete error: {de}")
-                            
-                            # 삭제 후 상태 업데이트 시간 초기화
+                for target in (pc_id, '__ALL__'):
+                    cmd_type = 'all' if target == '__ALL__' else 'individual'
+                    for payload in read_pending_commands(central_url, target, ssl_context, processed_push_ids):
+                        action = payload['action']
+                        message = payload.get('message', '')
+                        if cmd_type == 'individual' and action != 'remote_input':
                             self.last_status_update = 0
 
                         _log(f"Executing cmd: action={action}")
@@ -4010,7 +3889,6 @@ class HeadlessShutdownApp:
                             elif action == 'message':
                                 _log(f"message received in headless - showing ctypes messagebox: {message}")
                                 try:
-                                    import ctypes
                                     threading.Thread(target=lambda m=message: ctypes.windll.user32.MessageBoxW(0, m, "관리자 메시지", 0x40000), daemon=True).start()
                                 except Exception as e:
                                     _log(f"headless message error: {e}")
@@ -4103,51 +3981,12 @@ class HeadlessShutdownApp:
             return False
 
     def perform_auto_update(self, download_url):
-        validate_download_url(download_url)
-        """독립 updater.exe 프로세스를 실행하고 현재 프로세스를 종료한다."""
-        _log_path = os.path.join(application_path, 'headless_debug.log')
-        def _log(msg):
-            try:
-                with open(_log_path, 'a', encoding='utf-8') as f:
-                    f.write(f"[{datetime.now()}] {msg}\n")
-            except Exception:
-                pass
-
+        if not self._update_lock.acquire(blocking=False):
+            return
         try:
-            if not getattr(sys, 'frozen', False):
-                _log("[updater] Not frozen exe — skipping.")
-                return
-
-            # updater.exe 위치 (MEIPASS 번들 또는 exe 옆)
-            meipass_updater = os.path.join(sys._MEIPASS, 'updater.exe')
-            exe_dir_updater = os.path.join(os.path.dirname(sys.executable), 'updater.exe')
-            if os.path.exists(meipass_updater):
-                src_updater = meipass_updater
-            elif os.path.exists(exe_dir_updater):
-                src_updater = exe_dir_updater
-            else:
-                _log("[updater] updater.exe not found!")
-                return
-
-            import shutil
-            tmp_updater = private_updater_copy(src_updater)
-            _log(f"[updater] Copied to: {tmp_updater}")
-
-            local_app = os.environ.get('LOCALAPPDATA', application_path)
-            target_dir = os.path.join(local_app, 'AutoShutdown')
-            target_exe = os.path.join(target_dir, 'auto_shutdown.exe')
-
-            pid = str(os.getpid())
-            cmd = [tmp_updater, pid, download_url, target_exe, '--headless']
-            _log(f"[updater] Launching: {cmd}")
-            subprocess.Popen(
-                cmd,
-                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
-            )
-            _log("[updater] Updater launched. Exiting headless process.")
-            os._exit(0)
-        except Exception as e:
-            _log(f"[updater] perform_auto_update FAILED: {e}")
+            hand_off_update(download_url, lambda: self.is_running, ['--headless'])
+        finally:
+            self._update_lock.release()
 
 if __name__ == "__main__":
     try:
@@ -4183,58 +4022,58 @@ if __name__ == "__main__":
         sys.stdout = NullWriter()
         sys.stderr = NullWriter()
     
-    # --headless 인자가 있으면 즉시 백그라운드 모드로 진입 (try/except 바깥)
-    if "--headless" in sys.argv:
-        # 전역 중복 방지 Mutex 체크
-        ctypes.windll.kernel32.SetLastError(0)
-        mutex_global = ctypes.windll.kernel32.CreateMutexW(None, False, "Global\\AutoShutdownAppV2_Mutex")
-        err = ctypes.windll.kernel32.GetLastError()
-        if err == 183:
-            os._exit(0)  # sys.exit 대신 os._exit 사용하여 BaseException 우회
-        HeadlessShutdownApp()
-        os._exit(0)
-        
     try:
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.CreateMutexW.argtypes = (ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR)
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        global_mutex_name = 'Global\\AutoShutdownAppV2_Mutex'
+
+        def create_mutex(name):
+            ctypes.set_last_error(0)
+            handle = kernel32.CreateMutexW(None, False, name)
+            return handle, ctypes.get_last_error()
+
+        if '--headless' in sys.argv:
+            mutex_global, err = create_mutex(global_mutex_name)
+            if err in (183, 5):
+                sys.exit(0)
+            if not mutex_global:
+                raise ctypes.WinError(err)
+            HeadlessShutdownApp()
+            os._exit(0)
+
         # 1. 세션 내 중복 실행 차단용 Local 뮤텍스부터 체크
-        ctypes.windll.kernel32.SetLastError(0)
-        mutex_local = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\AutoShutdownAppV2_Mutex")
-        if ctypes.windll.kernel32.GetLastError() == 183:
+        mutex_local, err = create_mutex('Local\\AutoShutdownAppV2_Mutex')
+        if err == 183:
             sys.exit(0)
+        if not mutex_local:
+            raise ctypes.WinError(err)
 
         # 2. 전역 중복 실행 차단용 Global 뮤텍스 체크
-        ctypes.windll.kernel32.SetLastError(0)
-        mutex_global = ctypes.windll.kernel32.CreateMutexW(None, False, "Global\\AutoShutdownAppV2_Mutex")
-        err = ctypes.windll.kernel32.GetLastError()
-        
-        if err == 183 or err == 5:
-            # 다른 인스턴스(예: --headless)가 이미 실행 중인 경우에만 소켓 연결 시도 (바통 터치)
-            # 이로써 평상시 무의미한 소켓 연결 시도로 인한 딜레이를 100% 원천 차단!
+        mutex_global, err = create_mutex(global_mutex_name)
+        if err in (183, 5):
+            if mutex_global:
+                kernel32.CloseHandle(mutex_global)
             try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(0.3)
-                s.connect(('127.0.0.1', 19985))
-                s.sendall(b"exit")
-                s.recv(1024)
-                s.close()
-                
-                # 백그라운드 프로세스가 종료되고 Mutex를 해제할 때까지 최대 2초간 0.05초 간격으로 폴링
-                # 고정 대기 시간(0.5초) 대신 실시간 감지로 반응 속도를 극대화!
-                released = False
-                for _ in range(40):
-                    ctypes.windll.kernel32.SetLastError(0)
-                    test_mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "Global\\AutoShutdownAppV2_Mutex")
-                    test_err = ctypes.windll.kernel32.GetLastError()
-                    if test_err != 183 and test_err != 5:
-                        mutex_global = test_mutex
-                        released = True
-                        break
-                    time.sleep(0.05)
-                
-                if not released:
-                    sys.exit(0)
-            except Exception:
-                # 소켓 연결이 불가능한 경우 (실제 다른 GUI가 켜진 상태 등) 중복 실행 차단
+                with socket.create_connection(('127.0.0.1', 19985), timeout=2) as connection:
+                    connection.sendall(b'exit')
+                    if connection.recv(1024) != b'ok':
+                        sys.exit(0)
+            except OSError:
                 sys.exit(0)
+
+            for _ in range(50):
+                mutex_global, err = create_mutex(global_mutex_name)
+                if mutex_global and err != 183:
+                    break
+                if mutex_global:
+                    kernel32.CloseHandle(mutex_global)
+                time.sleep(0.1)
+            else:
+                sys.exit(0)
+        elif not mutex_global:
+            raise ctypes.WinError(err)
 
         root = ctk.CTk()
         app = AutoShutdownAppV2(root)
@@ -4246,8 +4085,8 @@ if __name__ == "__main__":
         pass  # 정상 종료 — 크래시 로그 남기지 않음
     except BaseException as e:
         try:
-            with open(os.path.join(application_path, "crash_debug.log"), "w", encoding="utf-8") as f:
-                f.write(f"CRASH OCCURRED: {type(e).__name__}: {e}\n")
+            with open(os.path.join(application_path, "crash_debug.log"), "a", encoding="utf-8") as f:
+                f.write(f"[{datetime.now()}] CRASH OCCURRED: {type(e).__name__}: {e}\n")
                 traceback.print_exc(file=f)
         except:
             pass
